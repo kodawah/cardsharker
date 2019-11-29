@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Minimum difference between market and buylist price
@@ -20,6 +21,9 @@ const Tolerance = 0.75
 
 // Minimum buylist price to consider
 const Threshold = 0.1
+
+// Maximum number of parallel requests
+const MaxConcurrency = 8
 
 const ConfigFile = "cfg.json"
 const OutputFile = "output.csv"
@@ -29,8 +33,123 @@ var Config struct {
 	UserName string `json:"user_name"`
 }
 
+type result struct {
+	err error
+
+	cardName     string
+	cardSet      string
+	price        float64
+	buylistPrice float64
+	isFoil       bool
+	url          string
+}
+
+func processEntry(record []string) (ret result) {
+	var err error
+	cardName := strings.TrimSpace(record[1])
+	cardSet := strings.TrimSpace(record[2])
+	isFoil := strings.TrimSpace(record[4]) != ""
+	buylistPrice, _ := strconv.ParseFloat(record[6], 64)
+
+	// skip small BL under this
+	if buylistPrice < Threshold {
+		return
+	}
+
+	// convert the CK name and set to CS versions
+	cardName, cardSet, err = processRecord(cardName, cardSet)
+	if err != nil {
+		ret.err = fmt.Errorf("Error parsing %q - %q\n", record, err)
+		return
+	} else if cardName == "" || cardSet == "" {
+		return
+	}
+
+	u, err := url.Parse(fmt.Sprintf("http://www.cardshark.com/API/%s/Get-Price.aspx", Config.UserName))
+	if err != nil {
+		ret.err = err
+		return
+	}
+	q := u.Query()
+	q.Set("apiKey", Config.ApiKey)
+	q.Set("CardName", cardName)
+	q.Set("CardSet", cardSet)
+	u.RawQuery = q.Encode()
+
+	resp, err := http.Get(u.String())
+	if err != nil {
+		ret.err = fmt.Errorf("Error retrieving %q - %q\n", record, err)
+		return
+	}
+	data, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		ret.err = fmt.Errorf("Error reading %q - %q\n", record, err)
+		return
+	}
+	if resp.StatusCode != 200 {
+		ret.err = fmt.Errorf("Error requesting %q - %q\n", record, string(data))
+		return
+	}
+
+	var response struct {
+		Status    string `xml:"status"`
+		Price     string `xml:"price"`
+		FoilPrice string `xml:"foilprice"`
+		Url       string `xml:"url"`
+	}
+	err = xml.Unmarshal(data, &response)
+	if err != nil {
+		ret.err = fmt.Errorf("Error decoding %q - %q\n", record, err)
+		return
+	}
+
+	// check for missing prerelease cards and wrong foil prices
+	isPrerelease := cardSet == "Prerelease Stamped"
+
+	if response.Status != "valid card" {
+		isConspiracy := cardSet == "Conspiracy Take the Crown"
+		isSunCe := cardName == "Sun Ce, Young Conquerer"
+
+		// skip errors for missing prerelease cards, CSP2-only
+		// conspiracies, and a single p3k card
+		if !isPrerelease && !isConspiracy && !isSunCe {
+			ret.err = fmt.Errorf("Invalid record: (%s/%s) %q\n", cardName, cardSet, record)
+		}
+		return
+	}
+
+	// handle foil pricing differently for promos
+	isPromo := strings.HasPrefix(cardSet, "Promotional")
+
+	// this roundabout way is because some extremenly high prices have a ","
+	// which prevents correct unmarshaling
+	marketPrice, _ := strconv.ParseFloat(strings.Replace(response.Price, ",", "", -1), 64)
+	foilPrice, _ := strconv.ParseFloat(strings.Replace(response.FoilPrice, ",", "", -1), 64)
+
+	price := marketPrice
+	if isFoil {
+		price = foilPrice
+	}
+	// can't trust the promos, pick the lowest among the two prices
+	if isPromo || isPrerelease {
+		price = foilPrice
+		if price-foilPrice > 0 {
+			price = marketPrice
+		}
+	}
+
+	ret.cardName = cardName
+	ret.cardSet = cardSet
+	ret.price = price
+	ret.buylistPrice = buylistPrice
+	ret.isFoil = isFoil
+	ret.url = response.Url
+	return
+}
+
 func run() int {
-	var prevSet string
+	l := log.New(os.Stderr, "", 0)
 
 	if len(os.Args) < 2 {
 		log.Fatal(fmt.Errorf("usage: <exe> <csv>"))
@@ -75,141 +194,77 @@ func run() int {
 	header := []string{"URL", "Name", "Set", "Foil", "Buylist Price", "CS Price", "Arb", "Spread"}
 	w.Write(header)
 
-	u, err := url.Parse(fmt.Sprintf("http://www.cardshark.com/API/%s/Get-Price.aspx", Config.UserName))
-	if err != nil {
-		log.Fatal(err)
+	records := make(chan []string)
+	results := make(chan result)
+	var wg sync.WaitGroup
+
+	// Read from the records channel and block the subroutine until done
+	// In this way you process entry up to MaxConcurrency at the same time
+	for i := 0; i < MaxConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			for record := range records {
+				results <- processEntry(record)
+			}
+			wg.Done()
+		}()
 	}
-	q := u.Query()
-	q.Set("apiKey", Config.ApiKey)
 
-	l := log.New(os.Stderr, "", 0)
-
-	entry := 0
-	for {
-		record, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		entry++
-
-		cardName := strings.TrimSpace(record[1])
-		cardSet := strings.TrimSpace(record[2])
-		isFoil := strings.TrimSpace(record[4]) != ""
-		buylistPrice, _ := strconv.ParseFloat(record[6], 64)
-
-		fmt.Printf("\033[2K\r[%05d] Processing '%s' card '%s' ", entry, cardSet, cardName)
-
-		// skip small BL under this
-		if buylistPrice < Threshold {
-			continue
-		}
-
-		// convert the CK name and set to CS versions
-		cardName, cardSet, err = processRecord(cardName, cardSet)
-		if err != nil {
-			l.Printf("Error parsing %q - %q\n", record, err)
-			continue
-		} else if cardName == "" || cardSet == "" {
-			continue
-		}
-
-		q.Set("CardName", cardName)
-		q.Set("CardSet", cardSet)
-		u.RawQuery = q.Encode()
-
-		resp, err := http.Get(u.String())
-		if err != nil {
-			l.Printf("Error retrieving %q - %q\n", record, err)
-			continue
-		}
-		data, err := ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			l.Printf("Error reading %q - %q\n", record, err)
-			continue
-		}
-		if resp.StatusCode != 200 {
-			l.Printf("Error requesting %q - %q\n", record, string(data))
-			continue
-		}
-
-		var response struct {
-			Status    string `xml:"status"`
-			Price     string `xml:"price"`
-			FoilPrice string `xml:"foilprice"`
-			Url       string `xml:"url"`
-		}
-		err = xml.Unmarshal(data, &response)
-		if err != nil {
-			l.Printf("Error decoding %q - %q\n", record, err)
-			l.Printf("%s\n", u.String())
-			continue
-		}
-
-		// check for missing prerelease cards and wrong foil prices
-		isPrerelease := cardSet == "Prerelease Stamped"
-
-		if response.Status != "valid card" {
-			isConspiracy := cardSet == "Conspiracy Take the Crown"
-			isSunCe := cardName == "Sun Ce, Young Conquerer"
-
-			// ignore errors for missing prerelease cards, CSP2-only
-			// conspiracies, and a single p3k card
-			if !isPrerelease && !isConspiracy && !isSunCe {
-				l.Printf("Invalid record: (%s/%s) %q\n", cardName, cardSet, record)
+	// Read from input file and queue records to be processed
+	// Close channels and wait group when done
+	// In case of error, wait for any remaining background routines
+	go func() {
+		for {
+			record, err := r.Read()
+			if err == io.EOF {
+				break
 			}
+			if err != nil {
+				l.Printf("Error reading record: %s", err.Error())
+				break
+			}
+
+			records <- record
+		}
+		close(records)
+
+		wg.Wait()
+		close(results)
+	}()
+
+	// Read from the result and apply any further logic
+	for result := range results {
+		if result.err != nil {
+			l.Println(result.err)
 			continue
 		}
 
-		// handle foil pricing differently for promos
-		isPromo := strings.HasPrefix(cardSet, "Promotional")
-
-		// this roundabout way is because some extremenly high prices have a ","
-		// which prevents correct unmarshaling
-		marketPrice, _ := strconv.ParseFloat(strings.Replace(response.Price, ",", "", -1), 64)
-		foilPrice, _ := strconv.ParseFloat(strings.Replace(response.FoilPrice, ",", "", -1), 64)
-
-		price := marketPrice
-		if isFoil {
-			price = foilPrice
-		}
-		// can't trust the promos, pick the lowest among the two prices
-		if isPromo || isPrerelease {
-			price = foilPrice
-			if price-foilPrice > 0 {
-				price = marketPrice
-			}
-		}
-
-		if price > 0 && price <= Tolerance*buylistPrice {
+		if result.price > 0 && result.price <= Tolerance*result.buylistPrice {
 			foil := ""
-			if isFoil {
+			if result.isFoil {
 				foil = "X"
 			}
-			buylistPriceStr := fmt.Sprintf("%0.2f", buylistPrice)
-			priceStr := fmt.Sprintf("%0.2f", price)
-			diff := fmt.Sprintf("%0.2f", buylistPrice-price)
-			spread := fmt.Sprintf("%0.2f%%", 100*(buylistPrice-price)/price)
+			buylistPriceStr := fmt.Sprintf("%0.2f", result.buylistPrice)
+			priceStr := fmt.Sprintf("%0.2f", result.price)
+			diff := fmt.Sprintf("%0.2f", result.buylistPrice-result.price)
+			spread := fmt.Sprintf("%0.2f%%", 100*(result.buylistPrice-result.price)/result.price)
 
-			record := []string{response.Url, cardName, cardSet, foil, buylistPriceStr, priceStr, diff, spread}
+			record := []string{
+				result.url,
+				result.cardName,
+				result.cardSet,
+				foil,
+				buylistPriceStr,
+				priceStr,
+				diff,
+				spread,
+			}
 			err := w.Write(record)
 			if err != nil {
 				log.Fatalln("Error writing record to csv: ", err)
 			}
-
-			// Only flush whenever the set changes for sssssssspeed
-			if prevSet != cardSet {
-				w.Flush()
-				prevSet = cardSet
-			}
 		}
 	}
-	fmt.Printf("\033\n")
-	w.Flush()
 
 	return 0
 }
