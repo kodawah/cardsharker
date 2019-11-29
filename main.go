@@ -26,7 +26,6 @@ const Threshold = 0.1
 const MaxConcurrency = 8
 
 const ConfigFile = "cfg.json"
-const OutputFile = "output.csv"
 
 var Config struct {
 	ApiKey   string `json:"api_key"`
@@ -183,17 +182,10 @@ func run() int {
 		log.Fatal("Malformed input file")
 	}
 
-	out, err := os.Create(OutputFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer out.Close()
-	w := csv.NewWriter(out)
+	w := csv.NewWriter(os.Stdout)
 	defer w.Flush()
 
-	header := []string{"URL", "Name", "Set", "Foil", "Buylist Price", "CS Price", "Arb", "Spread"}
-	w.Write(header)
-
+	entries := 0
 	records := make(chan []string)
 	results := make(chan result)
 	var wg sync.WaitGroup
@@ -240,6 +232,12 @@ func run() int {
 		}
 
 		if result.price > 0 && result.price <= Tolerance*result.buylistPrice {
+			if entries == 0 {
+				header := []string{
+					"URL", "Name", "Set", "Foil", "Buylist Price", "CS Price", "Arb", "Spread",
+				}
+				w.Write(header)
+			}
 			foil := ""
 			if result.isFoil {
 				foil = "X"
@@ -263,6 +261,9 @@ func run() int {
 			if err != nil {
 				log.Fatalln("Error writing record to csv: ", err)
 			}
+
+			w.Flush()
+			entries++
 		}
 	}
 
