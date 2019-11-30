@@ -50,6 +50,20 @@ func run() int {
 		log.Fatal(err)
 	}
 
+	r := csv.NewReader(file)
+	first, err := r.Read()
+	if err == io.EOF {
+		log.Fatal("Empty input file")
+	}
+	if err != nil {
+		log.Fatal("Error reading record: " + err.Error())
+	}
+	if len(first) < 7 || (first[1] != "Card Name" &&
+		first[2] != "CK_Modif_Set" && first[5] != "NF/F" &&
+		first[6] != "BL_Value") {
+		log.Fatal("Malformed input file")
+	}
+
 	out, err := os.Create(OutputFile)
 	if err != nil {
 		log.Fatal(err)
@@ -68,10 +82,9 @@ func run() int {
 	q := u.Query()
 	q.Set("apiKey", Config.ApiKey)
 
-	r := csv.NewReader(file)
 	l := log.New(os.Stderr, "", 0)
 
-	entry := -1
+	entry := 0
 	for {
 		record, err := r.Read()
 		if err == io.EOF {
@@ -82,15 +95,6 @@ func run() int {
 		}
 
 		entry++
-		if entry == 0 {
-			if len(record) < 7 && record[1] != "Card Name" &&
-				record[2] != "CK_Modif_Set" && record[4] != "NF/F" &&
-				record[6] != "BL_Value" {
-				fmt.Printf("%q", record)
-				log.Fatal(fmt.Errorf("Malformed input file"))
-			}
-			continue
-		}
 
 		cardName := strings.TrimSpace(record[1])
 		cardSet := strings.TrimSpace(record[2])
