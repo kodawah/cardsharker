@@ -47,8 +47,11 @@ func processEntry(record []string) (ret result) {
 	var err error
 	cardName := strings.TrimSpace(record[1])
 	cardSet := strings.TrimSpace(record[2])
-	isFoil := strings.TrimSpace(record[4]) != ""
-	buylistPrice, _ := strconv.ParseFloat(record[6], 64)
+	isFoil := strings.TrimSpace(record[5]) != ""
+	buylistPrice, _ := strconv.ParseFloat(record[7], 64)
+	if strings.HasPrefix(record[7], "$") {
+		buylistPrice, _ = strconv.ParseFloat(record[7][1:], 64)
+	}
 
 	// skip small BL under this
 	if buylistPrice < Threshold {
@@ -176,9 +179,9 @@ func run() int {
 	if err != nil {
 		log.Fatal("Error reading record: " + err.Error())
 	}
-	if len(first) < 7 || (first[1] != "Card Name" &&
+	if len(first) < 8 || (first[1] != "Card Name" &&
 		first[2] != "CK_Modif_Set" && first[5] != "NF/F" &&
-		first[6] != "BL_Value") {
+		first[7] != "BL_Value") {
 		log.Fatal("Malformed input file")
 	}
 

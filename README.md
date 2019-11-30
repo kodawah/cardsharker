@@ -3,7 +3,7 @@
 This script takes a csv file formatted as
 
 ```
-CK_Key,Card Name,CK_Modif_Set,Rarity,NF/F,MKT_Est,BL_Value
+CK_Key,Card Name,CK_Modif_Set,Set,Rarity,NF/F,MKT_Est,BL_Value
 ```
 
 and uses the data to query CardShark database to obtain the best offers on cards.
